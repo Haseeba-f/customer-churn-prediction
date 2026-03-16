@@ -1,10 +1,13 @@
 """
 Streamlit frontend for Salesforce Customer Churn Prediction.
-Connects to FastAPI backend at http://localhost:8000/predict.
+Loads the trained TensorFlow model directly — no FastAPI backend required.
 """
 
+import os
+import pickle
+
+import numpy as np
 import streamlit as st
-import requests
 import plotly.graph_objects as go
 
 # ── Page Config ──────────────────────────────────────────────
@@ -52,7 +55,92 @@ st.markdown("""
 st.markdown('<h1 class="main-title">🔮 Customer Churn Predictor</h1>', unsafe_allow_html=True)
 st.markdown('<p class="subtitle">Powered by Artificial Neural Network — Salesforce Dataset</p>', unsafe_allow_html=True)
 
-API_URL = "http://localhost:8000"
+
+# ── Model Loading (cached) ──────────────────────────────────
+@st.cache_resource
+def load_model_artifacts():
+    """Load the trained Keras model, scaler, and label encoders from the models/ directory."""
+    from tensorflow.keras.models import load_model  # noqa: delayed import to keep startup fast
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    models_dir = os.path.join(base_dir, "models")
+
+    model_path = os.path.join(models_dir, "churn_model.h5")
+    scaler_path = os.path.join(models_dir, "scaler.pkl")
+    encoders_path = os.path.join(models_dir, "label_encoders.pkl")
+
+    # Load Keras model
+    model = None
+    if os.path.exists(model_path):
+        model = load_model(model_path)
+    else:
+        st.error(f"⚠️ Model file not found at `{model_path}`. Run the training notebook first.")
+
+    # Load StandardScaler
+    scaler = None
+    if os.path.exists(scaler_path):
+        with open(scaler_path, "rb") as f:
+            scaler = pickle.load(f)
+
+    # Load LabelEncoders
+    label_encoders = None
+    if os.path.exists(encoders_path):
+        with open(encoders_path, "rb") as f:
+            label_encoders = pickle.load(f)
+
+    return model, scaler, label_encoders
+
+
+model, scaler, label_encoders = load_model_artifacts()
+
+# Feature definitions (must match training pipeline)
+FEATURE_ORDER = [
+    "CreditScore", "Geography", "Gender", "Age", "Tenure",
+    "Balance", "NumOfProducts", "HasCrCard", "IsActiveMember",
+    "EstimatedSalary",
+]
+CATEGORICAL_FEATURES = ["Geography", "Gender"]
+
+
+def preprocess_and_predict(input_dict: dict) -> dict:
+    """
+    Encode categoricals, scale features, run model prediction, and return result dict.
+    Replicates the exact preprocessing from the training notebook / FastAPI backend.
+    """
+    # ── Encode categoricals ──────────────────────────────────
+    if label_encoders:
+        for col in CATEGORICAL_FEATURES:
+            if col in label_encoders:
+                input_dict[col] = label_encoders[col].transform([input_dict[col]])[0]
+    else:
+        # Manual fallback (must match training)
+        geography_map = {"France": 0, "Germany": 1, "Spain": 2}
+        gender_map = {"Female": 0, "Male": 1}
+        input_dict["Geography"] = geography_map[input_dict["Geography"]]
+        input_dict["Gender"] = gender_map[input_dict["Gender"]]
+
+    # ── Build feature array in correct order & scale ─────────
+    features = np.array([[input_dict[f] for f in FEATURE_ORDER]], dtype=np.float64)
+    if scaler is not None:
+        features = scaler.transform(features)
+
+    # ── Predict ──────────────────────────────────────────────
+    probability = float(model.predict(features, verbose=0)[0][0])
+    prediction = "Churn" if probability >= 0.5 else "Retained"
+
+    if probability >= 0.8 or probability <= 0.2:
+        confidence = "High"
+    elif probability >= 0.6 or probability <= 0.4:
+        confidence = "Medium"
+    else:
+        confidence = "Low"
+
+    return {
+        "churn_probability": round(probability, 4),
+        "prediction": prediction,
+        "confidence": confidence,
+    }
+
 
 # ── Sidebar — Customer Features ──────────────────────────────
 st.sidebar.header("📋 Customer Features")
@@ -109,25 +197,26 @@ def create_gauge(probability: float) -> go.Figure:
 
 # ── Main Content ─────────────────────────────────────────────
 if predict_btn:
-    payload = {
-        "CreditScore": credit_score,
-        "Geography": geography,
-        "Gender": gender,
-        "Age": age,
-        "Tenure": tenure,
-        "Balance": balance,
-        "NumOfProducts": num_products,
-        "HasCrCard": has_cr_card[1],
-        "IsActiveMember": is_active[1],
-        "EstimatedSalary": estimated_salary,
-    }
+    if model is None:
+        st.error("⚠️ Model not loaded. Please run the training notebook first.")
+    else:
+        payload = {
+            "CreditScore": credit_score,
+            "Geography": geography,
+            "Gender": gender,
+            "Age": age,
+            "Tenure": tenure,
+            "Balance": balance,
+            "NumOfProducts": num_products,
+            "HasCrCard": has_cr_card[1],
+            "IsActiveMember": is_active[1],
+            "EstimatedSalary": estimated_salary,
+        }
 
-    try:
-        with st.spinner("Analyzing customer profile..."):
-            response = requests.post(f"{API_URL}/predict", json=payload, timeout=30)
+        try:
+            with st.spinner("Analyzing customer profile..."):
+                result = preprocess_and_predict(payload)
 
-        if response.status_code == 200:
-            result = response.json()
             prob = result["churn_probability"]
             prediction = result["prediction"]
             confidence = result["confidence"]
@@ -172,19 +261,8 @@ if predict_btn:
                 st.metric("Gender", gender)
                 st.metric("Active Member", "Yes" if is_active[1] else "No")
 
-        elif response.status_code == 503:
-            st.error("⚠️ Model not loaded. Please run the training notebook first.")
-        else:
-            st.error(f"API Error {response.status_code}: {response.json().get('detail', 'Unknown error')}")
-
-    except requests.ConnectionError:
-        st.error(
-            "🔌 Cannot connect to the API server.\n\n"
-            "**Start the backend first:**\n"
-            "```bash\ncd backend\nuvicorn main:app --reload --port 8000\n```"
-        )
-    except Exception as e:
-        st.error(f"Unexpected error: {str(e)}")
+        except Exception as e:
+            st.error(f"Prediction error: {str(e)}")
 
 else:
     # Landing state
